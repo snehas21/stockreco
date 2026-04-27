@@ -442,7 +442,30 @@
 </div>
 
 <script>
-const PROXY = 'https://api.allorigins.win/raw?url=';
+// Each entry is a function that wraps a target URL for that proxy's format.
+// Tried in order; first successful JSON parse wins.
+const PROXIES = [
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+];
+
+async function fetchViaProxy(targetUrl) {
+  let lastErr;
+  for (const proxy of PROXIES) {
+    try {
+      const res = await fetch(proxy(targetUrl), { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) { lastErr = new Error('HTTP ' + res.status); continue; }
+      const text = await res.text();
+      // codetabs and allorigins can wrap errors in HTML; reject if not JSON
+      if (!text.trimStart().startsWith('{') && !text.trimStart().startsWith('[')) {
+        lastErr = new Error('Non-JSON response'); continue;
+      }
+      return JSON.parse(text);
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('All proxies failed');
+}
 
 function fmt(n, dec = 2) {
   if (n == null) return '—';
@@ -491,16 +514,19 @@ async function lookup() {
   setStatus('<span class="spinner"></span>Fetching analyst data for ' + raw + '…');
 
   const modules = 'recommendationTrend,financialData,price';
-  const yfUrl = `https://query1.finance.yahoo.com/v11/finance/quoteSummary/${encodeURIComponent(raw)}?modules=${modules}&corsDomain=finance.yahoo.com`;
-  const url = PROXY + encodeURIComponent(yfUrl);
+  const makeYfUrl = host =>
+    `https://${host}.finance.yahoo.com/v11/finance/quoteSummary/${encodeURIComponent(raw)}?modules=${modules}`;
 
   let data;
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    data = await res.json();
+    // Try query1 first, then query2 as a mirror fallback
+    try {
+      data = await fetchViaProxy(makeYfUrl('query1'));
+    } catch {
+      data = await fetchViaProxy(makeYfUrl('query2'));
+    }
   } catch (e) {
-    setStatus('Network error – could not reach Yahoo Finance. Try again.', true);
+    setStatus('Network error – could not reach Yahoo Finance. Check your connection and try again.', true);
     setBtn(false);
     return;
   }
