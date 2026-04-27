@@ -610,46 +610,80 @@
 </div>
 
 <script>
-// Fire all proxy+endpoint combinations in parallel; resolve on the first valid response.
 const YF_MODULES = 'recommendationTrend,financialData,price';
 
+// Yahoo Finance requires a crumb token for authenticated API calls.
+// We fetch it first via the public getcrumb endpoint (direct or proxied).
+let _crumb = '';
+let _crumbFetched = false;
+
+async function getYFCrumb() {
+  if (_crumbFetched) return _crumb;
+  _crumbFetched = true;
+  const base = 'https://query2.finance.yahoo.com/v1/test/getcrumb';
+  const crumbAttempts = [
+    base,
+    `https://corsproxy.io/?url=${encodeURIComponent(base)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(base)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(base)}`,
+  ];
+  for (const url of crumbAttempts) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (!r.ok) continue;
+      const text = (await r.text()).trim();
+      // Crumb is a short token — not HTML, not JSON, not empty
+      if (text && text.length >= 5 && text.length <= 40 && !/[<{[\n]/.test(text)) {
+        _crumb = text;
+        break;
+      }
+    } catch {}
+  }
+  return _crumb;
+}
+
 async function fetchStock(ticker) {
+  const crumb = await getYFCrumb();
   const enc = encodeURIComponent(ticker);
   const mods = YF_MODULES;
+  const c = crumb ? `&crumb=${encodeURIComponent(crumb)}` : '';
 
-  // Two Yahoo Finance mirrors × two API versions = 4 base URLs
+  // Two YF mirrors × two API versions, with and without crumb
   const yfUrls = [
-    `https://query1.finance.yahoo.com/v11/finance/quoteSummary/${enc}?modules=${mods}`,
-    `https://query2.finance.yahoo.com/v11/finance/quoteSummary/${enc}?modules=${mods}`,
-    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=${mods}`,
-    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=${mods}`,
+    `https://query1.finance.yahoo.com/v11/finance/quoteSummary/${enc}?modules=${mods}${c}`,
+    `https://query2.finance.yahoo.com/v11/finance/quoteSummary/${enc}?modules=${mods}${c}`,
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=${mods}${c}`,
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=${mods}${c}`,
   ];
 
-  // CORS proxy wrappers (+ direct attempt)
   const wrap = [
     u => u,
     u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
     u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
     u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    u => `https://thingproxy.freeboard.io/fetch/${u}`,
   ];
 
-  // Expand to every combination (16 total)
   const attempts = yfUrls.flatMap(u => wrap.map(w => w(u)));
-
   let lastApiError = null;
 
   async function tryOne(url) {
+    // Read body regardless of HTTP status — proxies forward YF's 4xx JSON bodies as-is
     const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
-    if (!text.trimStart().startsWith('{')) throw new Error('non-json');
+    if (!text?.trimStart().startsWith('{')) throw new Error('non-json');
     const data = JSON.parse(text);
     const error = data?.quoteSummary?.error;
     if (error) {
-      lastApiError = error.description || error.code || 'API error';
-      throw Object.assign(new Error(lastApiError), { isApiError: true });
+      const desc = error.description || error.code || 'API error';
+      if (/not found|no.*data|no fundamentals/i.test(desc)) {
+        lastApiError = desc;
+        throw Object.assign(new Error(desc), { isApiError: true });
+      }
+      // Crumb / auth errors — keep trying other proxies
+      throw new Error('yf:' + (error.code || 'err'));
     }
-    if (!data?.quoteSummary?.result?.[0]) throw new Error('no result');
+    if (!data?.quoteSummary?.result?.[0]) throw new Error('no-result');
     return data;
   }
 
