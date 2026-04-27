@@ -610,29 +610,55 @@
 </div>
 
 <script>
-// Each entry is a function that wraps a target URL for that proxy's format.
-// Tried in order; first successful JSON parse wins.
-const PROXIES = [
-  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-];
+// Fire all proxy+endpoint combinations in parallel; resolve on the first valid response.
+const YF_MODULES = 'recommendationTrend,financialData,price';
 
-async function fetchViaProxy(targetUrl) {
-  let lastErr;
-  for (const proxy of PROXIES) {
-    try {
-      const res = await fetch(proxy(targetUrl), { signal: AbortSignal.timeout(10000) });
-      if (!res.ok) { lastErr = new Error('HTTP ' + res.status); continue; }
-      const text = await res.text();
-      // codetabs and allorigins can wrap errors in HTML; reject if not JSON
-      if (!text.trimStart().startsWith('{') && !text.trimStart().startsWith('[')) {
-        lastErr = new Error('Non-JSON response'); continue;
-      }
-      return JSON.parse(text);
-    } catch (e) { lastErr = e; }
+async function fetchStock(ticker) {
+  const enc = encodeURIComponent(ticker);
+  const mods = YF_MODULES;
+
+  // Two Yahoo Finance mirrors × two API versions = 4 base URLs
+  const yfUrls = [
+    `https://query1.finance.yahoo.com/v11/finance/quoteSummary/${enc}?modules=${mods}`,
+    `https://query2.finance.yahoo.com/v11/finance/quoteSummary/${enc}?modules=${mods}`,
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=${mods}`,
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=${mods}`,
+  ];
+
+  // CORS proxy wrappers (+ direct attempt)
+  const wrap = [
+    u => u,
+    u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+  ];
+
+  // Expand to every combination (16 total)
+  const attempts = yfUrls.flatMap(u => wrap.map(w => w(u)));
+
+  let lastApiError = null;
+
+  async function tryOne(url) {
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    if (!text.trimStart().startsWith('{')) throw new Error('non-json');
+    const data = JSON.parse(text);
+    const error = data?.quoteSummary?.error;
+    if (error) {
+      lastApiError = error.description || error.code || 'API error';
+      throw Object.assign(new Error(lastApiError), { isApiError: true });
+    }
+    if (!data?.quoteSummary?.result?.[0]) throw new Error('no result');
+    return data;
   }
-  throw lastErr || new Error('All proxies failed');
+
+  try {
+    return await Promise.any(attempts.map(tryOne));
+  } catch (e) {
+    if (lastApiError) throw Object.assign(new Error(lastApiError), { isApiError: true });
+    throw new Error('network');
+  }
 }
 
 function fmt(n, dec = 2) {
@@ -681,31 +707,19 @@ async function lookup() {
   document.getElementById('result-card').classList.remove('visible');
   setStatus('<span class="spinner"></span>Fetching analyst data for ' + raw + '…');
 
-  const modules = 'recommendationTrend,financialData,price';
-  const makeYfUrl = host =>
-    `https://${host}.finance.yahoo.com/v11/finance/quoteSummary/${encodeURIComponent(raw)}?modules=${modules}`;
-
   let data;
   try {
-    // Try query1 first, then query2 as a mirror fallback
-    try {
-      data = await fetchViaProxy(makeYfUrl('query1'));
-    } catch {
-      data = await fetchViaProxy(makeYfUrl('query2'));
-    }
+    data = await fetchStock(raw);
   } catch (e) {
-    setStatus('Network error – could not reach Yahoo Finance. Check your connection and try again.', true);
+    const msg = e.isApiError
+      ? `Ticker "${raw}" not found or no data available. Check the symbol and try again.`
+      : 'Could not reach Yahoo Finance. Check your connection and try again.';
+    setStatus(msg, true);
     setBtn(false);
     return;
   }
 
-  const result = data?.quoteSummary?.result?.[0];
-  const errMsg = data?.quoteSummary?.error?.description;
-  if (!result || errMsg) {
-    setStatus('Ticker "' + raw + '" not found or no data available. Check the symbol and try again.', true);
-    setBtn(false);
-    return;
-  }
+  const result = data.quoteSummary.result[0];
 
   const price   = result.price         || {};
   const fin     = result.financialData  || {};
